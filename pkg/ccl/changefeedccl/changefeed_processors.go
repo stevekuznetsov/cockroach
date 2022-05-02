@@ -38,7 +38,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
@@ -67,11 +66,8 @@ type changeAggregator struct {
 	kvFeedDoneCh chan struct{}
 	kvFeedMemMon *mon.BytesMonitor
 
-	// encoder is the Encoder to use for key and value serialization.
-	encoder Encoder
-	// sink is the Sink to write rows to. Resolved timestamps are never written
-	// by changeAggregator.
-	sink Sink
+	// emitter is the Emitter to use for row and timestamp emitting.
+	emitter Emitter
 	// changedRowBuf, if non-nil, contains changed rows to be emitted. Anything
 	// queued in `resolvedSpanBuf` is dependent on these having been emitted, so
 	// this one must be empty before moving on to that one.
@@ -168,10 +164,6 @@ func newChangeAggregatorProcessor(
 	}
 
 	var err error
-	if ca.encoder, err = getEncoder(ca.spec.Feed.Opts, AllTargets(ca.spec.Feed)); err != nil {
-		return nil, err
-	}
-
 	if _, needTopics := ca.spec.Feed.Opts[changefeedbase.OptTopicInValue]; needTopics {
 		ca.topicNamer, err = MakeTopicNamer(ca.spec.Feed.TargetSpecifications)
 		if err != nil {
@@ -272,24 +264,29 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 		return
 	}
 
-	ca.sink, err = getSink(ctx, ca.flowCtx.Cfg, ca.spec.Feed, timestampOracle,
-		ca.spec.User(), ca.spec.JobID, ca.sliMetrics)
-
+	encoder, err := getEncoder(ca.spec.Feed.Opts, AllTargets(ca.spec.Feed))
 	if err != nil {
-		err = changefeedbase.MarkRetryableError(err)
-		// Early abort in the case that there is an error creating the sink.
 		ca.MoveToDraining(err)
 		ca.cancel()
 		return
 	}
-
-	// This is the correct point to set up certain hooks depending on the sink
-	// type.
-	if b, ok := ca.sink.(*bufferSink); ok {
-		ca.changedRowBuf = &b.buf
+	var sink Sink
+	if ca.spec.Feed.SinkURI == "" {
+		s := &bufferSink{metrics: ca.sliMetrics, buf: encDatumRowBuffer{}}
+		ca.changedRowBuf = &s.buf
+		sink = s
+	} else {
+		sink, err = getSink(ctx, ca.flowCtx.Cfg, ca.spec.Feed, timestampOracle,
+			ca.spec.User(), ca.spec.JobID, ca.sliMetrics)
+		if err != nil {
+			err = changefeedbase.MarkRetryableError(err)
+			// Early abort in the case that there is an error creating the sink.
+			ca.MoveToDraining(err)
+			ca.cancel()
+			return
+		}
 	}
-
-	ca.sink = &errorWrapperSink{wrapped: ca.sink}
+	ca.emitter = newEncoderSinkEmitter(encoder, sink, ca.knobs)
 
 	ca.eventProducer, err = ca.startKVFeed(ctx, spans, initialHighWater, needsInitialScan, endTime, ca.sliMetrics)
 	if err != nil {
@@ -300,11 +297,11 @@ func (ca *changeAggregator) Start(ctx context.Context) {
 	}
 
 	if ca.spec.Feed.Opts[changefeedbase.OptFormat] == string(changefeedbase.OptFormatNative) {
-		ca.eventConsumer = newNativeKVConsumer(ca.sink)
+		ca.eventConsumer = newNativeKVConsumer(sink)
 	} else {
 		ca.eventConsumer = newKVEventToRowConsumer(
 			ctx, ca.flowCtx.Cfg, ca.frontier.SpanFrontier(), initialHighWater,
-			ca.sink, ca.encoder, ca.spec.Feed, ca.knobs, ca.topicNamer)
+			ca.emitter, ca.spec.Feed, ca.knobs, ca.topicNamer)
 	}
 }
 
@@ -479,9 +476,9 @@ func (ca *changeAggregator) close() {
 	if ca.kvFeedDoneCh != nil {
 		<-ca.kvFeedDoneCh
 	}
-	if ca.sink != nil {
-		if err := ca.sink.Close(); err != nil {
-			log.Warningf(ca.Ctx, `error closing sink. goroutines may have leaked: %v`, err)
+	if ca.emitter != nil {
+		if err := ca.emitter.Close(); err != nil {
+			log.Warningf(ca.Ctx, `error closing emitter. goroutines may have leaked: %v`, err)
 		}
 	}
 
@@ -558,7 +555,7 @@ func (ca *changeAggregator) tick() error {
 			return ca.noteResolvedSpan(resolved)
 		}
 	case kvevent.TypeFlush:
-		return ca.sink.Flush(ca.Ctx)
+		return ca.emitter.Flush(ca.Ctx)
 	}
 
 	return nil
@@ -599,7 +596,7 @@ func (ca *changeAggregator) flushFrontier() error {
 	// otherwise, we could lose buffered messages and violate the
 	// at-least-once guarantee. This is also true for checkpointing the
 	// resolved spans in the job progress.
-	if err := ca.sink.Flush(ca.Ctx); err != nil {
+	if err := ca.emitter.Flush(ca.Ctx); err != nil {
 		return err
 	}
 
@@ -680,9 +677,7 @@ type kvEventConsumer interface {
 
 type kvEventToRowConsumer struct {
 	frontier             *span.Frontier
-	encoder              Encoder
-	scratch              bufalloc.ByteAllocator
-	sink                 Sink
+	emitter              Emitter
 	cursor               hlc.Timestamp
 	knobs                TestingKnobs
 	rfCache              *rowFetcherCache
@@ -699,8 +694,7 @@ func newKVEventToRowConsumer(
 	cfg *execinfra.ServerConfig,
 	frontier *span.Frontier,
 	cursor hlc.Timestamp,
-	sink Sink,
-	encoder Encoder,
+	emitter Emitter,
 	details jobspb.ChangefeedDetails,
 	knobs TestingKnobs,
 	topicNamer *TopicNamer,
@@ -716,8 +710,7 @@ func newKVEventToRowConsumer(
 
 	return &kvEventToRowConsumer{
 		frontier:             frontier,
-		encoder:              encoder,
-		sink:                 sink,
+		emitter:              emitter,
 		cursor:               cursor,
 		rfCache:              rfCache,
 		details:              details,
@@ -911,33 +904,7 @@ func (c *kvEventToRowConsumer) ConsumeEvent(ctx context.Context, ev kvevent.Even
 			"or equal to the local frontier %s.", r.updated, c.frontier.Frontier())
 		return nil
 	}
-	var keyCopy, valueCopy []byte
-	encodedKey, err := c.encoder.EncodeKey(ctx, r)
-	if err != nil {
-		return err
-	}
-	c.scratch, keyCopy = c.scratch.Copy(encodedKey, 0 /* extraCap */)
-	encodedValue, err := c.encoder.EncodeValue(ctx, r)
-	if err != nil {
-		return err
-	}
-	c.scratch, valueCopy = c.scratch.Copy(encodedValue, 0 /* extraCap */)
-
-	if c.knobs.BeforeEmitRow != nil {
-		if err := c.knobs.BeforeEmitRow(ctx); err != nil {
-			return err
-		}
-	}
-	if err := c.sink.EmitRow(
-		ctx, topic,
-		keyCopy, valueCopy, r.updated, r.mvccTimestamp, ev.DetachAlloc(),
-	); err != nil {
-		return err
-	}
-	if log.V(3) {
-		log.Infof(ctx, `r %s: %s -> %s`, r.tableDesc.GetName(), keyCopy, valueCopy)
-	}
-	return nil
+	return c.emitter.EmitRow(ctx, topic, r, ev.DetachAlloc())
 }
 
 func (c *kvEventToRowConsumer) eventToRow(
@@ -1104,11 +1071,8 @@ type changeFrontier struct {
 	// frontier contains the current resolved timestamp high-water for the tracked
 	// span set.
 	frontier *schemaChangeFrontier
-	// encoder is the Encoder to use for resolved timestamp serialization.
-	encoder Encoder
-	// sink is the Sink to write resolved timestamps to. Rows are never written
-	// by changeFrontier.
-	sink Sink
+	// emitter is the Emitter to use for resolved timestamp emitting.
+	emitter Emitter
 	// freqEmitResolved, if >= 0, is a lower bound on the duration between
 	// resolved timestamp emits.
 	freqEmitResolved time.Duration
@@ -1145,8 +1109,8 @@ type changeFrontier struct {
 }
 
 const (
-	runStatusUpdateFrequency time.Duration = time.Minute
-	slowSpanMaxFrequency                   = 10 * time.Second
+	runStatusUpdateFrequency = time.Minute
+	slowSpanMaxFrequency     = 10 * time.Second
 )
 
 // jobState encapsulates changefeed job state.
@@ -1291,10 +1255,6 @@ func newChangeFrontierProcessor(
 		cf.freqEmitResolved = emitNoResolved
 	}
 
-	if cf.encoder, err = getEncoder(spec.Feed.Opts, AllTargets(spec.Feed)); err != nil {
-		return nil, err
-	}
-
 	return cf, nil
 }
 
@@ -1322,27 +1282,33 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 	// Pass a nil oracle because this sink is only used to emit resolved timestamps
 	// but the oracle is only used when emitting row updates.
 	var nilOracle timestampLowerBoundOracle
-	var err error
 	sli, err := cf.metrics.getSLIMetrics(cf.spec.Feed.Opts[changefeedbase.OptMetricsScope])
 	if err != nil {
 		cf.MoveToDraining(err)
 		return
 	}
 	cf.sliMetrics = sli
-	cf.sink, err = getSink(ctx, cf.flowCtx.Cfg, cf.spec.Feed, nilOracle,
-		cf.spec.User(), cf.spec.JobID, sli)
 
+	encoder, err := getEncoder(cf.spec.Feed.Opts, AllTargets(cf.spec.Feed))
 	if err != nil {
-		err = changefeedbase.MarkRetryableError(err)
 		cf.MoveToDraining(err)
 		return
 	}
-
-	if b, ok := cf.sink.(*bufferSink); ok {
-		cf.resolvedBuf = &b.buf
+	var sink Sink
+	if cf.spec.Feed.SinkURI == "" {
+		s := &bufferSink{metrics: sli, buf: encDatumRowBuffer{}}
+		cf.resolvedBuf = &s.buf
+		sink = s
+	} else {
+		sink, err = getSink(ctx, cf.flowCtx.Cfg, cf.spec.Feed, nilOracle,
+			cf.spec.User(), cf.spec.JobID, sli)
+		if err != nil {
+			err = changefeedbase.MarkRetryableError(err)
+			cf.MoveToDraining(err)
+			return
+		}
 	}
-
-	cf.sink = &errorWrapperSink{wrapped: cf.sink}
+	cf.emitter = newEncoderSinkEmitter(encoder, sink, TestingKnobs{})
 
 	cf.highWaterAtStart = cf.spec.Feed.StatementTime
 	if cf.spec.JobID != 0 {
@@ -1407,9 +1373,9 @@ func (cf *changeFrontier) close() {
 		if cf.metrics != nil {
 			cf.closeMetrics()
 		}
-		if cf.sink != nil {
-			if err := cf.sink.Close(); err != nil {
-				log.Warningf(cf.Ctx, `error closing sink. goroutines may have leaked: %v`, err)
+		if cf.emitter != nil {
+			if err := cf.emitter.Close(); err != nil {
+				log.Warningf(cf.Ctx, `error closing emitter. goroutines may have leaked: %v`, err)
 			}
 		}
 		cf.memAcc.Close(cf.Ctx)
@@ -1776,7 +1742,7 @@ func (cf *changeFrontier) maybeEmitResolved(newResolved hlc.Timestamp) error {
 	if !shouldEmit {
 		return nil
 	}
-	if err := emitResolvedTimestamp(cf.Ctx, cf.encoder, cf.sink, newResolved); err != nil {
+	if err := emitResolvedTimestamp(cf.Ctx, cf.emitter, newResolved); err != nil {
 		return err
 	}
 	cf.lastEmitResolved = newResolved.GoTime()

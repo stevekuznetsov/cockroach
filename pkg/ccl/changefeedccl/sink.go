@@ -70,6 +70,9 @@ func getSink(
 	jobID jobspb.JobID,
 	m *sliMetrics,
 ) (Sink, error) {
+	if feedCfg.SinkURI == "" {
+		return nil, errors.New("newSink() called with an empty Sink URI")
+	}
 	u, err := url.Parse(feedCfg.SinkURI)
 	if err != nil {
 		return nil, err
@@ -88,10 +91,6 @@ func getSink(
 	}
 
 	newSink := func() (Sink, error) {
-		if feedCfg.SinkURI == "" {
-			return &bufferSink{metrics: m}, nil
-		}
-
 		switch {
 		case u.Scheme == changefeedbase.SinkSchemeNull:
 			return makeNullSink(sinkURL{URL: u}, m)

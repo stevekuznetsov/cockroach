@@ -679,6 +679,9 @@ func validateSink(
 	details jobspb.ChangefeedDetails,
 	opts map[string]string,
 ) error {
+	if details.SinkURI == "" {
+		return nil
+	}
 	metrics := p.ExecCfg().JobRegistry.MetricsStruct().Changefeed.(*Metrics)
 	sli, err := metrics.getSLIMetrics(opts[changefeedbase.OptMetricsScope])
 	if err != nil {

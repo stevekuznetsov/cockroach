@@ -31,12 +31,10 @@ const (
 
 // emitResolvedTimestamp emits a changefeed-level resolved timestamp to the
 // sink.
-func emitResolvedTimestamp(
-	ctx context.Context, encoder Encoder, sink Sink, resolved hlc.Timestamp,
-) error {
+func emitResolvedTimestamp(ctx context.Context, emitter Emitter, resolved hlc.Timestamp) error {
 	// TODO(dan): Emit more fine-grained (table level) resolved
 	// timestamps.
-	if err := sink.EmitResolvedTimestamp(ctx, encoder, resolved); err != nil {
+	if err := emitter.EmitResolvedTimestamp(ctx, resolved); err != nil {
 		return err
 	}
 	if log.V(2) {

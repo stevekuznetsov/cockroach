@@ -209,6 +209,7 @@ func createBenchmarkChangefeed(
 		return nil, nil, err
 	}
 	sink := makeBenchSink()
+	emitter := newEncoderSinkEmitter(encoder, sink, TestingKnobs{})
 
 	settings := s.ClusterSettings()
 	metrics := MakeMetrics(base.DefaultHistogramWindowInterval()).(*Metrics)
@@ -244,7 +245,7 @@ func createBenchmarkChangefeed(
 	}
 	serverCfg := s.DistSQLServer().(*distsql.ServerImpl).ServerConfig
 	eventConsumer := newKVEventToRowConsumer(ctx, &serverCfg, sf, initialHighWater,
-		sink, encoder, details, TestingKnobs{}, nil)
+		emitter, details, TestingKnobs{}, nil)
 	tickFn := func(ctx context.Context) (*jobspb.ResolvedSpan, error) {
 		event, err := buf.Get(ctx)
 		if err != nil {
@@ -286,7 +287,7 @@ func createBenchmarkChangefeed(
 				}
 				if advanced {
 					frontier := sf.Frontier()
-					if err := emitResolvedTimestamp(ctx, encoder, sink, frontier); err != nil {
+					if err := emitResolvedTimestamp(ctx, emitter, frontier); err != nil {
 						return err
 					}
 				}
