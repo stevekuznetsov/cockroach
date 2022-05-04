@@ -87,6 +87,8 @@ func getEncoder(
 		return &nativeEncoder{}, nil
 	case changefeedbase.OptFormatCSV:
 		return newCSVEncoder(opts), nil
+	case changefeedbase.OptFormatRaw:
+		return nil, errors.Errorf("getEncoder called with %s=%s", changefeedbase.OptFormat, opts[changefeedbase.OptFormat])
 	default:
 		return nil, errors.Errorf(`unknown %s: %s`, changefeedbase.OptFormat, opts[changefeedbase.OptFormat])
 	}

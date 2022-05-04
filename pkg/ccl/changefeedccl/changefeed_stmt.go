@@ -437,8 +437,15 @@ func createChangefeedJobRecord(
 		}
 	}
 
-	if _, err := getEncoder(details.Opts, AllTargets(details)); err != nil {
-		return nil, err
+	if changefeedbase.FormatType(details.Opts[changefeedbase.OptFormat]) == changefeedbase.OptFormatRaw {
+		if !unspecifiedSink {
+			return nil, errors.Newf("option %s=%s can only be used when no sink is specified",
+				changefeedbase.OptFormat, changefeedbase.OptFormatRaw)
+		}
+	} else {
+		if _, err := getEncoder(details.Opts, AllTargets(details)); err != nil {
+			return nil, err
+		}
 	}
 
 	if isCloudStorageSink(parsedSink) || isWebhookSink(parsedSink) {
